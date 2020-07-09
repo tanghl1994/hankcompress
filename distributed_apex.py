@@ -235,8 +235,8 @@ class DistributedDataParallel(Module):
 
         self.create_hooks()
 
-        flat_dist_call(
-            [param.data for param in self.module.parameters()], dist.broadcast, (0,))
+        # flat_dist_call(
+        #     [param.data for param in self.module.parameters()], dist.broadcast, (0,))
 
     def enable_need_reduction(self):
         self.need_reduction = True

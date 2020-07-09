@@ -20,13 +20,11 @@ import torchvision.datasets as datasets
 import torchvision.models as models
 from distributed_apex import DistributedDataParallel as DDP
 import model as net
-import myoptim_scatter
-from tensorboardX import SummaryWriter
+# from tensorboardX import SummaryWriter
 import torchvision
-from compression import *
-import ecgrad
-import compress_update
-import rank_k
+import flatten_optim
+import flatten_myoptim_scatter
+
 
 from mpi4py import MPI
 
@@ -103,6 +101,7 @@ best_acc1 = 0
 def main():
     args = parser.parse_args()
 
+
     if args.seed is not None:
         random.seed(args.seed)
         torch.manual_seed(args.seed)
@@ -134,7 +133,7 @@ def main():
         # needs to be adjusted accordingly
         args.world_size = MPI_size
         args.rank = MPI_rank
-        torch.distributed.init_process_group(backend='nccl', init_method='tcp://10.228.58.143:12345',
+        torch.distributed.init_process_group(backend='nccl', init_method=args.dist_url,
                                              world_size=MPI_size, rank=MPI_rank)
 
     main_worker(gpu_id, ngpus_per_node, args)
@@ -151,13 +150,13 @@ def main_worker(gpu, ngpus_per_node, args):
     if args.pretrained:
         print("=> using pre-trained model '{}'".format(args.arch))
         # model = models.__dict__[args.arch](pretrained=True)
-        model = net.PreActResNet18()
+        # model = net.PreActResNet18()
     else:
         print("=> creating model '{}'".format(args.arch))
         # model = models.__dict__[args.arch]()
-        model = net.PreActResNet18()
+        # model = net.PreActResNet18()
         # model = net.PreActResNet50()
-        # model = net.PreActResNet152()
+        model = net.PreActResNet152()
 
     if args.distributed:
         # For multiprocessing distributed, DistributedDataParallel constructor
@@ -186,18 +185,21 @@ def main_worker(gpu, ngpus_per_node, args):
         else:
             model = torch.nn.DataParallel(model).cuda()
 
+
+
     # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda(args.gpu)
 
-    optimizer = myoptim_scatter.ComAdam(model.parameters(), args.lr, acc_step = 1)
+    optimizer = flatten_myoptim_scatter.ComAdam(model.parameters(), args.lr, acc_step = 1)
+    optimizer = flatten_optim.Flatten_Optim(optimizer)
 
-    global path
-    path = 'ComAdam_Cifar10_resnet18_%d_lr_%.5f_acc%d_BS_%d_FE_%d'%(args.rankk,args.lr,args.acc_step,args.batch_size * optimizer.get_mpi_size() ,args.freeze_epoch)
+    # global path
+    # path = 'ComAdam_Cifar10_resnet18_%d_lr_%.5f_acc%d_BS_%d_FE_%d'%(args.rankk,args.lr,args.acc_step,args.batch_size * optimizer.get_mpi_size() ,args.freeze_epoch)
 
-    if path not in os.listdir('./tensorboard_plots'):
-        os.mkdir('./tensorboard_plots/' + path)
-    global writer
-    writer = SummaryWriter('tensorboard_plots/' + path)
+    # if path not in os.listdir('./tensorboard_plots'):
+    #     os.mkdir('./tensorboard_plots/' + path)
+    # global writer
+    # writer = SummaryWriter('tensorboard_plots/' + path)
 
     # optionally resume from a checkpoint
     if args.resume:
@@ -274,22 +276,6 @@ def main_worker(gpu, ngpus_per_node, args):
         # train for one epoch
         train(train_loader, model, criterion, optimizer, epoch, args, adam_freeze = adam_freeze)
 
-        # evaluate on validation set
-        acc1 = validate(val_loader, model, criterion, args)
-
-        # remember best acc@1 and save checkpoint
-        is_best = acc1 > best_acc1
-        best_acc1 = max(acc1, best_acc1)
-
-        if not args.multiprocessing_distributed or (args.multiprocessing_distributed
-                and args.rank % ngpus_per_node == 0):
-            save_checkpoint({
-                'epoch': epoch + 1,
-                'arch': args.arch,
-                'state_dict': model.state_dict(),
-                'best_acc1': best_acc1,
-                'optimizer': optimizer.state_dict(),
-            }, 1)
 
 
 def train(train_loader, model, criterion, optimizer, epoch, args, adam_freeze):
@@ -305,9 +291,11 @@ def train(train_loader, model, criterion, optimizer, epoch, args, adam_freeze):
 
     # switch to train mode
     model.train()
+    total_params = sum(p.numel() for p in model.parameters())
 
     end = time.time()
     global globalstep
+
     for i, (images, target) in enumerate(train_loader):
 
         # print(globalstep)
@@ -339,23 +327,25 @@ def train(train_loader, model, criterion, optimizer, epoch, args, adam_freeze):
         loss.backward()
 
         # optimizer.step(adam_freeze = adam_freeze)
+
         start_time = time.time()
-        if acc_key == 0:
-            optimizer.step(adam_freeze = adam_freeze)
-        end_time = time.time()
-        print('One optimization step for processing {} parameters takes {}s'.format(1,end_time - start_time))
+        if globalstep %2 ==0:
+            optimizer.step(adam_freeze = True, m_size = total_params)
+            end_time = time.time()
+            # if MPI.COMM_WORLD.Get_rank() == 0:
+            #     print('One Compressed optimization step for processing {} parameters takes {}s'.format(total_params,end_time - start_time))
+        else:
+            optimizer.step(adam_freeze=True, m_size = total_params)
+            end_time = time.time()
+            # if MPI.COMM_WORLD.Get_rank() == 0:
+            #     print('One Uncompressed optimization step for processing {} parameters takes {}s'.format(total_params, end_time - start_time))
 
         globalstep += 1
 
         # measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
-        if optimizer.get_mpi_rank() == 0 and globalstep%args.acc_step == 0:
-            global writer
-            writer.add_scalar('loss', loss*args.acc_step, globalstep*args.batch_size*optimizer.get_mpi_size())
 
-        # if i % args.print_freq == 0:
-        #     progress.display(i)
 
 
 def validate(val_loader, model, criterion, args):

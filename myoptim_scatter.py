@@ -4,7 +4,7 @@ import torch
 import sys
 from torch.optim.optimizer import Optimizer
 import torch.distributed as dist
-from compression import *
+# from compression import *
 
 from mpi4py import MPI
 from torch.utils.dlpack import to_dlpack, from_dlpack
